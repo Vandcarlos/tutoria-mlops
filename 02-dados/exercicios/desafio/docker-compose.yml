@@ -1,0 +1,104 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW_CONN_PG_DWH: postgresql+psycopg2://${PG_DWH_USER}:${PG_DWH_PASS}@${PG_DWH_HOST}:${PG_DWH_PORT}/${PG_DWH_DB}
+
+    MLFLOW_TRACKING_URI: file:///opt/airflow/mlruns
+    MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME}
+
+    DATASET_KAGGLE_HUB: ${DATASET_KAGGLE_HUB}
+    AIRFLOW_DATA_DIR: ${AIRFLOW_DATA_DIR}
+  volumes:
+    - ./requirements.txt:/requirements.txt
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./logs:/opt/airflow/logs
+    - ./data:/opt/airflow/data
+    - ./plugins:/opt/airflow/plugins
+    - ./mlruns:/opt/airflow/mlruns
+    - python_deps:/home/airflow/.local
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+  depends_on:
+    - airflow-postgres
+
+services:
+  airflow-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: ["/bin/bash"]
+    command:
+      - -c
+      - |
+        if [ -f /requirements.txt ]; then pip install --no-cache-dir -r /requirements.txt; fi
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - airflow-init
+      - etl-postgres
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow-init
+      - etl-postgres
+
+  mlflow-ui:
+    image: python:3.12-slim
+    command: >
+      sh -c "pip install mlflow && mlflow ui --backend-store-uri file:///opt/airflow/mlruns --host 0.0.0.0 --port 5001"
+    volumes:
+      - ./mlruns:/opt/airflow/mlruns
+    ports:
+      - "5002:5001"
+    depends_on:
+      - airflow-init
+
+  etl-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${PG_DWH_USER}
+      POSTGRES_PASSWORD: ${PG_DWH_PASS}
+      POSTGRES_DB: ${PG_DWH_DB}
+    ports: ["5433:5432"]
+    volumes: [etl_pg_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U ${PG_DWH_USER} -d ${PG_DWH_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  airflow_db:
+  python_deps:
+  etl_pg_data:
